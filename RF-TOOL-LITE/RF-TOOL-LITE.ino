@@ -11,11 +11,40 @@
  *******************************************************************/
  
 #include <EEPROM.h>
+#if defined(ESP32)
+#include <WiFi.h>
+#include <WebServer.h>
+#endif
 #include "OneButton.h"
 #include "SSD1306Ascii.h"
 #include "SSD1306AsciiWire.h"
 SSD1306AsciiWire oled;
 
+#if defined(ARDUINO_ESP32C3_DEV) || defined(ESP32C3)
+#define rxPin 10                        // Приемник (GPIO, изменить под свою плату)
+#define rxOn 9                          // Включение приёмника
+#define txPin 8                         // Передатчик
+#define ledCach1 5                      // Индикатор кеша 1
+#define ledCach2 6                      // Индикатор кеша 2
+#define ledJammer 4                     // Индикатор глушилки
+#define btsendPin1 0                    // кнопка 1 (ADC)
+#define btsendPin2 1                    // кнопка 2 (ADC)
+#define bip 7                           // Вибро
+#define batteryPin 4                    // Измерение батареи (ADC)
+#define EEPROM_SIZE 512
+#elif defined(ESP32)
+#define rxPin 27                        // Приемник (GPIO, изменить под свою плату)
+#define rxOn 26                         // Включение приёмника
+#define txPin 25                        // Передатчик
+#define ledCach1 23                     // Индикатор кеша 1
+#define ledCach2 19                     // Индикатор кеша 2
+#define ledJammer 18                    // Индикатор глушилки
+#define btsendPin1 36                   // кнопка 1 (ADC)
+#define btsendPin2 39                   // кнопка 2 (ADC)
+#define bip 5                           // Вибро
+#define batteryPin 32                   // Измерение батареи (ADC)
+#define EEPROM_SIZE 512
+#else
 #define rxPin 2                         // Приемник
 #define rxOn 3                          // Включение приёмника
 #define txPin 4                         // Передатчик
@@ -25,8 +54,12 @@ SSD1306AsciiWire oled;
 #define btsendPin1 A1                   // кнопка 1
 #define btsendPin2 A2                   // кнопка 2
 #define bip A0                          // Вибро
+#endif
 #define pulseAN 412                     // длительность импульса AN-Motors
 #define maxDelta 200                    // максимальное отклонение от длительности при приеме
+#define BATTERY_MIN_MV 3300
+#define BATTERY_MAX_MV 4200
+#define BATTERY_DIVIDER 2.0
 
 OneButton button1(btsendPin1, false);   // вызов функции отслеживания кнопка 1
 OneButton button2(btsendPin2, false);   // вызов функции отслеживания кнопка 2
@@ -66,8 +99,176 @@ boolean displayClear = true;            // первичная очистка д�
 
 unsigned long voltage = 0;              // процент заряда АКБ
 
+#if defined(ESP32)
+const char *WIFI_SSID = "YOUR_SSID";
+const char *WIFI_PASSWORD = "YOUR_PASSWORD";
+WebServer server(80);
+
+long parseLongValue(const String &value) {
+  return strtol(value.c_str(), nullptr, 0);
+}
+
+String buildRootPage() {
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'/>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'/>";
+  page += "<title>RF-TOOL LITE</title>";
+  page += "<style>body{font-family:Arial;margin:20px;background:#0f172a;color:#e2e8f0;}";
+  page += ".card{background:#111827;padding:16px;border-radius:12px;margin-bottom:16px;}";
+  page += "textarea{width:100%;min-height:140px;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:8px;}";
+  page += "button{padding:10px 14px;margin:4px;border:0;border-radius:8px;";
+  page += "background:#a855f7;color:#0f172a;font-weight:bold;}</style></head><body>";
+  page += "<h1>RF-TOOL LITE</h1>";
+  page += "<div class='card'><h2>Actions</h2>";
+  page += "<form method='POST' action='/action'><button name='cmd' value='send_cache1'>Send Cache 1</button>";
+  page += "<button name='cmd' value='send_cache2'>Send Cache 2</button>";
+  page += "<button name='cmd' value='clear_cache'>Clear Cache</button></form></div>";
+  page += "<div class='card'><h2>Backup</h2>";
+  page += "<p><a href='/download'>Download captured data</a></p>";
+  page += "<form method='POST' action='/upload'>";
+  page += "<textarea name='data' placeholder='Paste backup data here'></textarea>";
+  page += "<button type='submit'>Upload backup</button></form></div>";
+  page += "<div class='card'><h2>Status</h2><div id='status'>Loading...</div></div>";
+  page += "<script>async function load(){const r=await fetch('/status');";
+  page += "const d=await r.json();document.getElementById('status').innerText=JSON.stringify(d,null,2);}load();";
+  page += "setInterval(load,2000);</script></body></html>";
+  return page;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", buildRootPage());
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"cache1\":" + String(Cash1) + ",";
+  json += "\"cache2\":" + String(Cash2) + ",";
+  json += "\"voltage\":" + String(voltage);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleAction() {
+  if (!server.hasArg("cmd")) {
+    server.send(400, "text/plain", "Missing cmd");
+    return;
+  }
+  String cmd = server.arg("cmd");
+  if (cmd == "send_cache1") {
+    click1();
+  } else if (cmd == "send_cache2") {
+    doubleclick1();
+  } else if (cmd == "clear_cache") {
+    longPressStart2();
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDownload() {
+  String payload;
+  payload += "CASH1=" + String(Cash1) + "\n";
+  payload += "CASH2=" + String(Cash2) + "\n";
+  payload += "CAME1=" + String(cashCame1) + "\n";
+  payload += "CAME2=" + String(cashCame2) + "\n";
+  payload += "NICE1=" + String(cashNice1) + "\n";
+  payload += "NICE2=" + String(cashNice2) + "\n";
+  server.send(200, "text/plain", payload);
+}
+
+void applyUploadLine(const String &line) {
+  int eq = line.indexOf('=');
+  if (eq < 0) {
+    return;
+  }
+  String key = line.substring(0, eq);
+  String value = line.substring(eq + 1);
+  key.trim();
+  value.trim();
+  if (key == "CASH1") {
+    Cash1 = parseLongValue(value);
+    EEPROM.put(0, Cash1);
+  } else if (key == "CASH2") {
+    Cash2 = parseLongValue(value);
+    EEPROM.put(10, Cash2);
+  } else if (key == "CAME1") {
+    cashCame1 = parseLongValue(value);
+    EEPROM.put(20, cashCame1);
+  } else if (key == "CAME2") {
+    cashCame2 = parseLongValue(value);
+    EEPROM.put(30, cashCame2);
+  } else if (key == "NICE1") {
+    cashNice1 = parseLongValue(value);
+    EEPROM.put(40, cashNice1);
+  } else if (key == "NICE2") {
+    cashNice2 = parseLongValue(value);
+    EEPROM.put(50, cashNice2);
+  }
+}
+
+void handleUpload() {
+  String data = server.arg("data");
+  if (data.length() == 0 && server.hasArg("plain")) {
+    data = server.arg("plain");
+  }
+  if (data.length() == 0) {
+    server.send(400, "text/plain", "Missing data");
+    return;
+  }
+  int start = 0;
+  while (start < data.length()) {
+    int end = data.indexOf('\n', start);
+    if (end < 0) {
+      end = data.length();
+    }
+    String line = data.substring(start, end);
+    line.trim();
+    if (line.length() > 0) {
+      applyUploadLine(line);
+    }
+    start = end + 1;
+  }
+  eepromCommit();
+  cachView();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void initWeb() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(250);
+  }
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/action", HTTP_POST, handleAction);
+  server.on("/download", HTTP_GET, handleDownload);
+  server.on("/upload", HTTP_POST, handleUpload);
+  server.begin();
+}
+#endif
+
+void initEeprom() {
+#if defined(ESP32)
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("EEPROM init failed");
+  }
+#endif
+}
+
+void eepromCommit() {
+#if defined(ESP32)
+  EEPROM.commit();
+#endif
+}
+
 void setup() {
   Serial.begin(9600);
+#if defined(ESP32)
+  analogReadResolution(12);
+#endif
+  initEeprom();
 
   pinMode(rxPin, INPUT);
   pinMode(txPin, OUTPUT);
@@ -81,7 +282,7 @@ void setup() {
   pinMode(btsendPin2, INPUT);
 
   cachView();                             // Индикатор кеша, запрос кеша из EEPROM
-  attachInterrupt(0, grab, CHANGE);       // Перехват пакетов ( 1 для Pro Micro | 0 для Uno, Nano, Pro Mini )
+  attachInterrupt(digitalPinToInterrupt(rxPin), grab, CHANGE);       // Перехват пакетов
   randomSeed(analogRead(0));              // Генерация случайного числа для AN-Motors
 
   button1.attachClick(click1);
@@ -93,6 +294,9 @@ void setup() {
   oled.begin(&Adafruit128x64, 0x3C);
   oled.clear();
   oled.setFont(Arial14);
+#if defined(ESP32)
+  initWeb();
+#endif
 
   unsigned long lasttime = 0;
   while (true) {
@@ -120,6 +324,9 @@ void setup() {
 
 void loop() {
   //Отслеживание нажатия кнопок
+#if defined(ESP32)
+  server.handleClient();
+#endif
   button1.tick();
   button2.tick();
 
@@ -216,6 +423,7 @@ void longPressStart1() {
   }
 
   if (checkCash == 1) {
+    eepromCommit();
     clearDisplay();
     oled.println("Ms: Save to EEPROM");
   } else {
@@ -267,6 +475,7 @@ void longPressStart2() {
   for (int i = 0; i <= 70; i++) {
     EEPROM.put(i, 0);
   }
+  eepromCommit();
   clearDisplay();
   oled.println("Ms: Cache is cleared");
   digitalWrite(ledCach1, LOW);
@@ -387,7 +596,11 @@ boolean CheckValue(unsigned int base, unsigned int value) {
   return ((value == base) || ((value > base) && ((value - base) < maxDelta)) || ((value < base) && ((base - value) < maxDelta)));
 }
 
+#if defined(ESP32)
+void IRAM_ATTR grab() {
+#else
 void grab() {
+#endif
   state = digitalRead(rxPin);
   if (state == HIGH)
     lolen = micros() - prevtime;
@@ -609,7 +822,19 @@ void bipLong(boolean led) {
 }
 
 long readVcc() {
-#if defined(__AVR_ATmega32U4__)
+#if defined(ESP32)
+  int raw = analogRead(batteryPin);
+  float voltage = (raw / 4095.0) * 3.3 * BATTERY_DIVIDER;
+  long mv = static_cast<long>(voltage * 1000.0);
+  long percent = (mv - BATTERY_MIN_MV) * 100 / (BATTERY_MAX_MV - BATTERY_MIN_MV);
+  if (percent > 100) {
+    return 100;
+  }
+  if (percent < 0) {
+    return 0;
+  }
+  return percent;
+#elif defined(__AVR_ATmega32U4__)
   ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
 #else
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
